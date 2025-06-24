@@ -199,6 +199,8 @@ public class MainActivity extends AppCompatActivity {
                 float[][][] recognizerOutput = new float[1][outputTimeSteps][outputClasses];
                 recognizer.run(recognizerInput, recognizerOutput);
 
+                Log.d("RECOGNIZER_OUTPUT", Arrays.deepToString(recognizerOutput));
+
                 // Decode
                 String recognizedText = decodeRecognizerOutput(recognizerOutput[0], alphabet);
 
