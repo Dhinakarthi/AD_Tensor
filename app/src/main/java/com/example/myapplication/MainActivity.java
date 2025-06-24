@@ -1,34 +1,36 @@
 package com.example.myapplication;
 
 import android.Manifest;
+import android.app.ProgressDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.Rect;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.provider.MediaStore;
 import android.util.Log;
 import android.widget.Button;
+import android.widget.Toast;
 
 import androidx.activity.EdgeToEdge;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
-import androidx.core.graphics.Insets;
-import androidx.core.view.ViewCompat;
-import androidx.core.view.WindowInsetsCompat;
 
-import org.tensorflow.lite.DataType;
 import org.tensorflow.lite.Interpreter;
 
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.net.URI;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
@@ -39,15 +41,11 @@ public class MainActivity extends AppCompatActivity {
 
     private Interpreter recognizer;
     private Interpreter detector;
-    private static final int REQUEST_CODE_PICK_IMAGE = 1001;
-    private static final int REQUEST_PERMISSION_CODE = 1002;
+    private ProgressDialog progressDialog;
 
-    int INPUT_WIDTH = 608;   // <- Change to your model's input width
-    int INPUT_HEIGHT = 800;   // <- Change to your model's input height
-    int MAX_CHAR_LEN = 32;   // <- Max characters your model predicts
-    int NUM_CLASSES = 80;    // <- Size of your label set
+    int MAX_CHAR_LEN = 32;
+    int NUM_CLASSES = 80;
 
-    // Example alphabet (must match your training)
     private final String[] alphabet = {
             "0","1","2","3","4","5","6","7","8","9",
             "A","B","C","D","E","F","G","H","I","J",
@@ -59,73 +57,64 @@ public class MainActivity extends AppCompatActivity {
             ".",",","-"," ","/","_"
     };
 
+    private final ActivityResultLauncher<Intent> imagePickerLauncher =
+            registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
+                if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                    Uri imageUri = result.getData().getData();
+                    try {
+                        InputStream inputStream = getContentResolver().openInputStream(imageUri);
+                        Bitmap bitmap = BitmapFactory.decodeStream(inputStream);
+                        processImage(bitmap);
+                    } catch (FileNotFoundException e) {
+                        showToast("Image not found");
+                        Log.e("BITMAP_LOAD_ERROR", e.getMessage());
+                    }
+                }
+            });
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         EdgeToEdge.enable(this);
         setContentView(R.layout.activity_main);
         Button button = findViewById(R.id.button);
+
         detector = loadModelFile(this, "EasyOCR_EasyOCRDetector.tflite");
         recognizer = loadModelFile(this, "EasyOCR_EasyOCRRecognizer.tflite");
+
+        if (detector == null || recognizer == null) {
+            showToast("Failed to load models.");
+            return;
+        }
 
         button.setOnClickListener(v -> checkPermission());
     }
 
     private void checkPermission() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
-        != PackageManager.PERMISSION_DENIED){
-            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQUEST_PERMISSION_CODE);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.READ_MEDIA_IMAGES}, 1002);
+                return;
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, 1002);
+                return;
+            }
         }
-        else {
-            openGallery();
-        }
+
+        openGallery();
     }
 
-    private void openGallery(){
+    private void openGallery() {
         Intent intent = new Intent(Intent.ACTION_PICK);
         intent.setType("image/*");
-        startActivityForResult(intent, REQUEST_CODE_PICK_IMAGE);
+        imagePickerLauncher.launch(intent);
     }
 
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQUEST_CODE_PICK_IMAGE && resultCode == RESULT_OK && data != null) {
-            Uri imageUri = data.getData();
-
-            try {
-                Bitmap bitmap = MediaStore.Images.Media.getBitmap(this.getContentResolver(), imageUri);
-
-                int[] shape = detector.getInputTensor(0).shape();
-                DataType dtype = detector.getInputTensor(0).dataType();
-                Log.d("MODEL_SHAPE", Arrays.toString(shape));
-                Log.d("MODEL_TYPE", dtype.toString());
-
-                ByteBuffer input = preprocessImage(bitmap, INPUT_WIDTH, INPUT_HEIGHT);
-
-                // Detector output should match [1, 1, 64, 1000] — same shape recognizer expects
-                float[][][][] features = new float[1][304][400][2];
-
-
-                detector.run(input, features);
-                float[][][][] recognizerInput = features;
-
-                int MAX_SEQ_LEN = 32;
-                int NUM_CLASSES = 80;
-                float[][] recognizerOutput = new float[MAX_SEQ_LEN][NUM_CLASSES];
-
-                recognizer.run(recognizerInput, recognizerOutput);
-
-                String textResult = decodeRecognizerOutput(recognizerOutput, alphabet);
-                Log.d("OCR_RESULT", "Recognized Text: " + textResult);
-            } catch (Exception e){
-                Log.d("Errrod dadada", e.getMessage());
-            }
-
-        }
-    }
-
-    private Interpreter loadModelFile(Context context, String modelName){
+    private Interpreter loadModelFile(Context context, String modelName) {
         try {
             AssetFileDescriptor fileDescriptor = context.getAssets().openFd(modelName);
             FileInputStream inputStream = new FileInputStream(fileDescriptor.getFileDescriptor());
@@ -134,38 +123,121 @@ public class MainActivity extends AppCompatActivity {
             long declaredLength = fileDescriptor.getDeclaredLength();
             MappedByteBuffer modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength);
             return new Interpreter(modelBuffer);
-        }
-        catch (Exception e) {
-            e.printStackTrace();
+        } catch (Exception e) {
+            Log.e("MODEL_LOAD_ERROR", e.getMessage());
             return null;
         }
     }
 
-    private ByteBuffer preprocessImage(Bitmap bitmap, int width, int height) {
-        // Resize to model input size
+    private ByteBuffer preprocessImage(Bitmap bitmap, int width, int height, int channels) {
         Bitmap resized = Bitmap.createScaledBitmap(bitmap, width, height, true);
-
-        // Allocate buffer: width x height x 3 (RGB) x 4 bytes (float)
-        ByteBuffer buffer = ByteBuffer.allocateDirect(1 * width * height * 3 * 4);
+        ByteBuffer buffer = ByteBuffer.allocateDirect(4 * width * height * channels);
         buffer.order(ByteOrder.nativeOrder());
 
         int[] pixels = new int[width * height];
         resized.getPixels(pixels, 0, width, 0, 0, width, height);
 
         for (int pixel : pixels) {
-            // Extract RGB channels from ARGB_8888
-            buffer.putFloat(((pixel >> 16) & 0xFF) / 255.0f); // R
-            buffer.putFloat(((pixel >> 8) & 0xFF) / 255.0f);  // G
-            buffer.putFloat((pixel & 0xFF) / 255.0f);
+            if (channels == 1) {
+                float r = ((pixel >> 16) & 0xFF) / 255.0f;
+                float g = ((pixel >> 8) & 0xFF) / 255.0f;
+                float b = (pixel & 0xFF) / 255.0f;
+                float gray = (r + g + b) / 3.0f;
+                buffer.putFloat(gray);
+            } else {
+                buffer.putFloat(((pixel >> 16) & 0xFF) / 255.0f); // R
+                buffer.putFloat(((pixel >> 8) & 0xFF) / 255.0f);  // G
+                buffer.putFloat((pixel & 0xFF) / 255.0f);         // B
+            }
         }
 
         return buffer;
     }
 
+    private void processImage(Bitmap bitmap) {
+        progressDialog = ProgressDialog.show(this, "Processing", "Running detection...", true);
+        new Thread(() -> {
+            try {
+                // Get detector input shape
+                int[] detectorShape = detector.getInputTensor(0).shape(); // [1, H, W, C]
+                int detHeight = detectorShape[1];
+                int detWidth = detectorShape[2];
+                int detChannels = detectorShape[3];
+
+                ByteBuffer detectorInput = preprocessImage(bitmap, detWidth, detHeight, detChannels);
+                float[][][][] detectorOutput = new float[1][detector.getOutputTensor(0).shape()[1]][detector.getOutputTensor(0).shape()[2]][detector.getOutputTensor(0).shape()[3]];
+
+                detector.run(detectorInput, detectorOutput);
+                Log.d("DETECTOR_OUTPUT", Arrays.deepToString(detectorOutput));
+
+                // Dummy crop for now
+                int boxWidth = bitmap.getWidth() / 2;
+                int boxHeight = bitmap.getHeight() / 4;
+                int x = (bitmap.getWidth() - boxWidth) / 2;
+                int y = (bitmap.getHeight() - boxHeight) / 2;
+                Rect dummyBox = new Rect(x, y, x + boxWidth, y + boxHeight);
+                Bitmap cropped = safeCrop(bitmap, dummyBox);
+
+                if (cropped == null) {
+                    runOnUiThread(() -> showToast("Invalid bounding box, skipping."));
+                    return;
+                }
+
+                // Get recognizer input shape
+                int[] recShape = recognizer.getInputTensor(0).shape(); // [1, H, W, C]
+                int recHeight = recShape[1];
+                int recWidth = recShape[2];
+                int recChannels = recShape[3];
+
+                ByteBuffer recognizerInput = preprocessImage(cropped, recWidth, recHeight, recChannels);
+                // Get the correct output shape from the model
+                int[] outputShape = recognizer.getOutputTensor(0).shape(); // e.g. [1, 249, 97]
+                int outputTimeSteps = outputShape[1];
+                int outputClasses = outputShape[2];
+
+                // Create array dynamically
+                float[][][] recognizerOutput = new float[1][outputTimeSteps][outputClasses];
+                recognizer.run(recognizerInput, recognizerOutput);
+
+                // Decode
+                String recognizedText = decodeRecognizerOutput(recognizerOutput[0], alphabet);
+
+                runOnUiThread(() -> {
+                    progressDialog.dismiss();
+                    showToast("Detected Text: " + recognizedText);
+                    Log.d("RECOGNIZED_TEXT", recognizedText);
+                });
+
+            } catch (Exception e) {
+                Log.e("PROCESS_ERROR", e.toString());
+                runOnUiThread(() -> {
+                    progressDialog.dismiss();
+                    showToast("Error: " + e.getMessage());
+                });
+            }
+        }).start();
+    }
+
+    private Bitmap safeCrop(Bitmap bitmap, Rect box) {
+        int x = Math.max(0, box.left);
+        int y = Math.max(0, box.top);
+        int right = Math.min(box.right, bitmap.getWidth());
+        int bottom = Math.min(box.bottom, bitmap.getHeight());
+
+        int width = right - x;
+        int height = bottom - y;
+
+        if (width <= 0 || height <= 0) {
+            Log.e("CROP_ERROR", "Invalid crop region: width=" + width + ", height=" + height);
+            return null;
+        }
+
+        return Bitmap.createBitmap(bitmap, x, y, width, height);
+    }
+
     private String decodeRecognizerOutput(float[][] output, String[] alphabet) {
         StringBuilder result = new StringBuilder();
         int lastIndex = -1;
-
         for (float[] timestep : output) {
             int maxIdx = 0;
             float maxVal = timestep[0];
@@ -175,16 +247,16 @@ public class MainActivity extends AppCompatActivity {
                     maxIdx = i;
                 }
             }
-
-            // Avoid duplicates or CTC blank (if blank = alphabet.length)
             if (maxIdx != lastIndex && maxIdx < alphabet.length) {
                 result.append(alphabet[maxIdx]);
                 lastIndex = maxIdx;
             }
         }
-
         return result.toString();
     }
 
 
+    private void showToast(String message) {
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+    }
 }
