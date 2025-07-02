@@ -13,7 +13,6 @@ import android.graphics.Rect;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.provider.MediaStore;
 import android.util.Log;
 import android.widget.Button;
 import android.widget.Toast;
@@ -21,7 +20,6 @@ import android.widget.Toast;
 import androidx.activity.EdgeToEdge;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
-import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
@@ -36,11 +34,13 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.Buffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.*;
+
 
 public class MainActivity2 extends AppCompatActivity {
 
@@ -238,6 +238,108 @@ public class MainActivity2 extends AppCompatActivity {
         }
     }
 
+    private ByteBuffer preprocessRecognizerImage(Bitmap bitmap, int[] inputShape, DataType inputDtype, float scale, int zeroPoint, Integer overrideHeight, Integer overrideWidth, int widthDivisor) {
+        if (inputShape.length != 4) {
+            throw new IllegalArgumentException("Input shape must be 4D. Got: " + Arrays.toString(inputShape));
+        }
+
+        int batch = inputShape[0];
+        int d1 = inputShape[1];
+        int d2 = inputShape[2];
+        int d3 = inputShape[3];
+
+        String layout;
+        int channels, targetH, targetW;
+
+        if (d3 == 1 || d3 == 3) {
+            layout = "NHWC";
+            channels = d3;
+            targetH = d1;
+            targetW = d2;
+        } else if (d1 == 1 || d1 == 3) {
+            layout = "NCHW";
+            channels = d1;
+            targetH = d2;
+            targetW = d3;
+        } else {
+            layout = "NHWC";
+            channels = 3;
+            targetH = d1;
+            targetW = d2;
+        }
+
+        if (targetH <= 0) {
+            if (overrideHeight == null) {
+                throw new IllegalArgumentException("Dynamic height requires overrideHeight.");
+            }
+            targetH = overrideHeight;
+        }
+
+        if (targetW <= 0) {
+            int origW = bitmap.getWidth();
+            int origH = bitmap.getHeight();
+            int newW = (int) Math.ceil(origW * (targetH / (float) origH));
+            if (widthDivisor > 1) {
+                newW = (int) Math.ceil(newW / (float) widthDivisor) * widthDivisor;
+            }
+            targetW = newW;
+        }
+
+        Bitmap resized = Bitmap.createScaledBitmap(bitmap, targetW, targetH, true);
+        int pixelCount = targetH * targetW;
+        int[] pixels = new int[pixelCount];
+        resized.getPixels(pixels, 0, targetW, 0, 0, targetW, targetH);
+
+        int elementSize = (inputDtype == DataType.FLOAT32) ? 4 : 1;
+        int bufferSize = batch * targetH * targetW * channels * elementSize;
+        ByteBuffer buffer = ByteBuffer.allocateDirect(bufferSize);
+        buffer.order(ByteOrder.nativeOrder());
+
+        if (layout.equals("NHWC")) {
+            for (int i = 0; i < targetH; i++) {
+                for (int j = 0; j < targetW; j++) {
+                    int color = pixels[i * targetW + j];
+                    int r = (color >> 16) & 0xFF;
+                    int g = (color >> 8) & 0xFF;
+                    int b = color & 0xFF;
+
+                    if (channels == 1) {
+                        float gray = (r + g + b) / 3f / 255f;
+                        writeToBuffer(buffer, gray, inputDtype, scale, zeroPoint);
+                    } else {
+                        writeToBuffer(buffer, r / 255f, inputDtype, scale, zeroPoint);
+                        writeToBuffer(buffer, g / 255f, inputDtype, scale, zeroPoint);
+                        writeToBuffer(buffer, b / 255f, inputDtype, scale, zeroPoint);
+                    }
+                }
+            }
+        } else if (layout.equals("NCHW")) {
+            for (int c = 0; c < channels; c++) {
+                for (int i = 0; i < targetH; i++) {
+                    for (int j = 0; j < targetW; j++) {
+                        int color = pixels[i * targetW + j];
+                        int r = (color >> 16) & 0xFF;
+                        int g = (color >> 8) & 0xFF;
+                        int b = color & 0xFF;
+                        float value;
+
+                        if (channels == 1) {
+                            value = (r + g + b) / 3f / 255f;
+                        } else {
+                            value = ((c == 0) ? r : (c == 1) ? g : b) / 255f;
+                        }
+
+                        writeToBuffer(buffer, value, inputDtype, scale, zeroPoint);
+                    }
+                }
+            }
+        }
+
+        buffer.rewind();
+        return buffer;
+    }
+
+
     private static int getNumBytesPerChannel(DataType dtype) {
         switch (dtype) {
             case FLOAT32:
@@ -250,23 +352,7 @@ public class MainActivity2 extends AppCompatActivity {
         }
     }
 
-    public static class Box {
-        public int xMin, yMin, xMax, yMax;
-
-        public Box(int xMin, int yMin, int xMax, int yMax) {
-            this.xMin = xMin;
-            this.yMin = yMin;
-            this.xMax = xMax;
-            this.yMax = yMax;
-        }
-
-        @Override
-        public String toString() {
-            return "(" + xMin + "," + yMin + "," + xMax + "," + yMax + ")";
-        }
-    }
-
-    private void loadLabels(Context context, String fileName) {
+    private List<String> loadLabels(Context context, String fileName) {
         labels = new ArrayList<>();
 
         try {
@@ -290,7 +376,10 @@ public class MainActivity2 extends AppCompatActivity {
             labels = null;
             blankIndex = -1;
         }
+
+        return labels;
     }
+
 
     public static List<Box> findConnectedBoxes(byte[][] mask, int minArea) {
         int h = mask.length;
@@ -382,16 +471,117 @@ public class MainActivity2 extends AppCompatActivity {
         return (float) (1.0 / (1.0 + Math.exp(-x)));
     }
 
+    public String runRecognizer(Interpreter interpreter,
+                                Bitmap cropImg,
+                                int[] recInputShape,
+                                DataType recInputDtype,
+                                Tensor.QuantizationParams recInputQuant,
+                                Integer overrideHeight,
+                                Integer overrideWidth,
+                                int widthDivisor,
+                                List<String> labels,
+                                Integer blankIndex) {
+
+        float scale = recInputQuant != null ? recInputQuant.getScale() : 1.0f;
+        int zeroPoint = recInputQuant != null ? recInputQuant.getZeroPoint() : 0;
+
+        ByteBuffer inputBuffer = preprocessRecognizerImage(
+                cropImg, recInputShape, recInputDtype, scale, zeroPoint,
+                overrideHeight, overrideWidth, widthDivisor);
+
+        printByteBuffer(inputBuffer, recInputDtype, 20);
+
+        // Run inference
+        Tensor outputTensor = interpreter.getOutputTensor(0);
+        int[] outputShape = outputTensor.shape();
+        DataType outputDtype = outputTensor.dataType();
+
+        // Create output array based on model output shape
+        float[][][] output = new float[outputShape[0]][outputShape[1]][outputShape[2]];
+        interpreter.run(inputBuffer, output);
+
+        Log.v("Outtt", Arrays.deepToString(output));
+        // Optional: Output stats
+        float min = Float.MAX_VALUE, max = -Float.MAX_VALUE, sum = 0;
+        int count = 0;
+
+        for (float[][] row : output) {
+            for (float[] timestep : row) {
+                for (float val : timestep) {
+                    min = Math.min(min, val);
+                    max = Math.max(max, val);
+                    sum += val;
+                    count++;
+                }
+            }
+        }
+
+        float mean = count > 0 ? sum / count : 0;
+        Log.d("RECOGNIZER_STATS", String.format("Output shape: %s, min=%.6f, max=%.6f, mean=%.6f",
+                Arrays.toString(outputShape), min, max, mean));
+
+        // Decode using greedy CTC
+        if (blankIndex == null) {
+            blankIndex = labels.size() - 1;
+        }
+
+        String text = decodeCTCGreedy(output, labels, blankIndex);
+        Log.d("RECOGNIZER_TEXT", "Decoded text: '" + text + "'");
+
+        return text;
+    }
+
+    private String decodeCTCGreedy(float[][][] logits, List<String> labels, int blankIndex) {
+        if (logits.length != 1) return "?"; // Only batch size 1 supported
+
+        float[][] timeSteps = logits[0];
+        StringBuilder decoded = new StringBuilder();
+        int prev = -1;
+
+        for (float[] timestep : timeSteps) {
+            int maxIdx = argMax(timestep);
+
+            if (maxIdx == prev || maxIdx == blankIndex) {
+                prev = maxIdx;
+                continue;
+            }
+
+            if (maxIdx >= 0 && maxIdx < labels.size()) {
+                decoded.append(labels.get(maxIdx));
+            } else {
+                decoded.append('?');
+            }
+
+            prev = maxIdx;
+        }
+
+        return decoded.toString();
+    }
+
+    private int argMax(float[] array) {
+        int maxIdx = 0;
+        float maxVal = array[0];
+        for (int i = 1; i < array.length; i++) {
+            if (array[i] > maxVal) {
+                maxVal = array[i];
+                maxIdx = i;
+            }
+        }
+        return maxIdx;
+    }
+
+
     private void processImage(Bitmap bitmap) {
         progressDialog = ProgressDialog.show(this, "Processing", "Running detection...", true);
+
         new Thread(() -> {
             try {
-                // 1. Get model input metadata
+                // 1. Detector model metadata
                 int[] detectorShape = detector.getInputTensor(0).shape();  // [1,H,W,C] or [1,C,H,W]
                 DataType inputDtype = detector.getInputTensor(0).dataType();
                 Tensor.QuantizationParams inputQuant = detector.getInputTensor(0).quantizationParams();
 
-                // 2. Preprocess input image
+                // 2. Preprocess image
                 Result detectorInput = preprocessDetectorImage(bitmap, detectorShape, inputDtype, inputQuant);
 
                 int[] outputShape = detector.getOutputTensor(0).shape();
@@ -404,21 +594,62 @@ public class MainActivity2 extends AppCompatActivity {
                 byte[][] mask = postprocessScoreLink(detectorOutput, textThreshold, linkThreshold);
                 List<Box> boxes = findConnectedBoxes(mask, 10);
 
-                loadLabels(this, "labels.txt");
+                // Load labels for recognizer
+                List<String> labels = loadLabels(this, "labels.txt");
 
-                // Recognizer
-                int[] recShape = recognizer.getInputTensor(0).shape();  // [1,H,W,C] or [1,C,H,W]
+                if (labels == null || labels.isEmpty()) {
+                    throw new RuntimeException("Label list is empty or failed to load.");
+                }
+
+                // Recognizer metadata
+                int[] recShape = recognizer.getInputTensor(0).shape();
                 DataType recDtype = recognizer.getInputTensor(0).dataType();
                 Tensor.QuantizationParams recQuant = recognizer.getInputTensor(0).quantizationParams();
 
+                int origW = bitmap.getWidth();
+                int origH = bitmap.getHeight();
+                int resizedW = detectorInput.targetW;
+                int resizedH = detectorInput.targetH;
 
+                int maskW = mask[0].length;
+                int maskH = mask.length;
+
+                int overrideHeight = 32;         // or any value matching recognizer model height
+                int widthDivisor = 1;            // used for padding width if required
+                int blankIndex = labels.size() - 1;
+
+                for (Box box : boxes) {
+                    Rect boxOrig = mapBoxMaskToOriginal(box, maskW, maskH, resizedW, resizedH, origW, origH);
+
+                    int x1 = boxOrig.left;
+                    int y1 = boxOrig.top;
+                    int x2 = boxOrig.right;
+                    int y2 = boxOrig.bottom;
+
+                    if ((x2 - x1) < 5 || (y2 - y1) < 5) {
+                        Log.w("CROP", "Skipping too-small region: (" + x1 + "," + y1 + "," + x2 + "," + y2 + ")");
+                        continue;
+                    }
+
+                    if (x2 > x1 && y2 > y1) {
+                        Bitmap crop = Bitmap.createBitmap(bitmap, x1, y1, x2 - x1, y2 - y1);
+                        Log.v("CROP", "Cropped bitmap size: width=" + crop.getWidth() + ", height=" + crop.getHeight() + " from (" + x1 + "," + y1 + ") to (" + x2 + "," + y2 + ")");
+
+                        String result = runRecognizer(recognizer, crop, recShape, recDtype, recQuant, overrideHeight, null, widthDivisor, labels, blankIndex);
+
+                        Log.v("RESULT", result);
+
+                    } else {
+                        Log.w("CROP", "Invalid crop size: (" + x1 + "," + y1 + "," + x2 + "," + y2 + ")");
+                    }
+                }
 
                 runOnUiThread(() -> {
                     Log.d("Input shape", Arrays.toString(detectorShape));
                     Log.d("Buffer size", String.valueOf(detectorInput.buffer.capacity()));
                     printByteBuffer(detectorInput.buffer, inputDtype, 20);
                     Log.d("RAW_MAPS", Arrays.deepToString(detectorOutput));
-                    Log.d("MASK_DEBUG", "Detector mask shape: (" + mask.length + "," + mask[0].length + "), resized image: (" + detectorInput.targetW + "," + detectorInput.targetH + "), original: (" + bitmap.getWidth() + "," + bitmap.getHeight() + ")");
+                    Log.d("MASK_DEBUG", "Detector mask shape: (" + mask.length + "," + mask[0].length + "), resized image: (" + resizedW + "," + resizedH + "), original: (" + origW + "," + origH + ")");
                     Log.d("BOXES", "Found " + boxes.size() + " regions in mask coords.");
                     for (Box box : boxes) {
                         Log.d("BOX_COORDS", box.toString());
@@ -430,7 +661,6 @@ public class MainActivity2 extends AppCompatActivity {
                     showToast("Detection completed");
                 });
 
-
             } catch (Exception e) {
                 Log.e("PROCESS_ERROR", Log.getStackTraceString(e));
                 runOnUiThread(() -> {
@@ -440,6 +670,41 @@ public class MainActivity2 extends AppCompatActivity {
             }
         }).start();
     }
+
+
+    public static Rect mapBoxMaskToOriginal(Box box, int maskW, int maskH, int resizedW, int resizedH, int origW, int origH) {
+        int xMin = box.x1;
+        int yMin = box.y1;
+        int xMax = box.x2;
+        int yMax = box.y2;
+
+        // Step 1: map mask coords to resized coords
+        int x1_r = xMin * 2;
+        int x2_r = (xMax + 1) * 2;
+        int y1_r = yMin * 2;
+        int y2_r = (yMax + 1) * 2;
+
+        // Step 2: resized → original
+        float fx = (float) origW / resizedW;
+        float fy = (float) origH / resizedH;
+
+        int x1 = Math.round(x1_r * fx);
+        int x2 = Math.round(x2_r * fx);
+        int y1 = Math.round(y1_r * fy);
+        int y2 = Math.round(y2_r * fy);
+
+        // Clip
+        x1 = Math.max(0, Math.min(x1, origW - 1));
+        x2 = Math.max(1, Math.min(x2, origW));
+        y1 = Math.max(0, Math.min(y1, origH - 1));
+        y2 = Math.max(1, Math.min(y2, origH));
+
+        if (x2 <= x1) x2 = Math.min(origW, x1 + 1);
+        if (y2 <= y1) y2 = Math.min(origH, y1 + 1);
+
+        return new Rect(x1, y1, x2, y2);
+    }
+
 
     private void printByteBuffer(ByteBuffer buffer, DataType dtype, int maxElements) {
         buffer.rewind(); // Start from beginning
@@ -466,6 +731,7 @@ public class MainActivity2 extends AppCompatActivity {
 
 
     private void showToast(String message) {
+        Log.v("Error", message);
         Toast.makeText(this, message, Toast.LENGTH_LONG).show();
     }
 }
